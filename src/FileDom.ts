@@ -184,6 +184,54 @@ enum SystemType {
     LINUX = 'Linux'
 }
 
+// One elevated grant per directory per process. New per-window CSS files keep
+// appearing under workbench/, so unlocking the folder once avoids a UAC prompt
+// on every new window.
+const dirUnlockInFlight = new Map<string, Promise<void>>();
+
+function quoteWinPath(filePath: string): string {
+    return `"${filePath}"`;
+}
+
+async function unlockDir(dirPath: string): Promise<void> {
+    window.setStatusBarMessage(
+        '正在开放背景文件目录写入权限，请在弹出的授权窗口中确认一次。 / Granting write access to the background folder. Please confirm the permission prompt once.',
+        15000
+    );
+    const systemType = os.type();
+    if (systemType === SystemType.WINDOWS) {
+        const quoted = quoteWinPath(dirPath);
+        // (OI)(CI) = new files and subfolders inherit Users:F, so later windows
+        // can create css-background-cover.<session>.css without another prompt.
+        await SudoPromptHelper.exec(
+            `takeown /f ${quoted} /a & icacls ${quoted} /grant "Users:(OI)(CI)F"`
+        );
+        return;
+    }
+    if (systemType === SystemType.MACOS || systemType === SystemType.LINUX) {
+        await SudoPromptHelper.exec(`chmod a+rwx ${quoteWinPath(dirPath)}`);
+    }
+}
+
+async function ensureDirWritable(dirPath: string): Promise<void> {
+    const normalized = path.normalize(dirPath);
+    const existing = dirUnlockInFlight.get(normalized);
+    if (existing) {
+        await existing;
+        return;
+    }
+    const task = unlockDir(normalized).catch((error) => {
+        dirUnlockInFlight.delete(normalized);
+        throw error;
+    });
+    dirUnlockInFlight.set(normalized, task);
+    await task;
+}
+
+function isElevationCancelled(error: unknown): boolean {
+    return /did not grant permission|canceled|cancelled/i.test(String(error));
+}
+
 export async function removeBackgroundCoverCssFiles(): Promise<void> {
     if (!(await fse.pathExists(WORKBENCH_DIR))) {
         return;
@@ -197,20 +245,34 @@ export async function removeBackgroundCoverCssFiles(): Promise<void> {
     }
     const cssFiles = names.filter(name => name.startsWith('css-background-cover') && name.endsWith('.css'));
     const systemType = os.type();
+    let dirUnlocked = false;
     for (const name of cssFiles) {
         const filePath = path.join(WORKBENCH_DIR, name);
         try {
             await fse.remove(filePath);
+            continue;
         } catch {
-            try {
-                if (systemType === SystemType.WINDOWS) {
-                    await SudoPromptHelper.exec(`del "${filePath}"`);
-                } else {
-                    await SudoPromptHelper.exec(`rm "${filePath}"`);
+            if (!dirUnlocked) {
+                try {
+                    await ensureDirWritable(WORKBENCH_DIR);
+                    dirUnlocked = true;
+                    await fse.remove(filePath);
+                    continue;
+                } catch (error) {
+                    if (isElevationCancelled(error)) {
+                        throw error;
+                    }
                 }
-            } catch (error) {
-                console.warn(`[FileDom] Failed to remove ${filePath}:`, error);
             }
+        }
+        try {
+            if (systemType === SystemType.WINDOWS) {
+                await SudoPromptHelper.exec(`del ${quoteWinPath(filePath)}`);
+            } else {
+                await SudoPromptHelper.exec(`rm ${quoteWinPath(filePath)}`);
+            }
+        } catch (error) {
+            console.warn(`[FileDom] Failed to remove ${filePath}:`, error);
         }
     }
 }
@@ -799,27 +861,23 @@ export class FileDom {
         }
     }
 
-    // 获取文件权限
+    // 获取单个文件权限（目录授权仍盖不住的已有受保护文件才走这里）
     public async getFilePermission(filePath: string): Promise<void> {
         try {
-            if (!(await fse.pathExists(filePath))) {
-                if (this.systemType === SystemType.WINDOWS) {
-                    await SudoPromptHelper.exec(`echo. > "${filePath}"`);
-                } else {
-                    await SudoPromptHelper.exec(`touch "${filePath}"`);
-                }
+            const quoted = quoteWinPath(filePath);
+            const exists = await fse.pathExists(filePath);
+            if (this.systemType === SystemType.WINDOWS) {
+                const create = exists ? '' : `echo. > ${quoted} & `;
+                await SudoPromptHelper.exec(
+                    `${create}takeown /f ${quoted} /a & icacls ${quoted} /grant Users:F`
+                );
+                return;
             }
-            switch (this.systemType) {
-                case SystemType.WINDOWS:
-                    await SudoPromptHelper.exec(`takeown /f "${filePath}" /a`);
-                    await SudoPromptHelper.exec(`icacls "${filePath}" /grant Users:F`);
-                    break;
-                case SystemType.MACOS:
-                    await SudoPromptHelper.exec(`chmod a+rwx "${filePath}"`);
-                    break;
-                case SystemType.LINUX:
-                    await SudoPromptHelper.exec(`chmod 666 "${filePath}"`);
-                    break;
+            const chmodCmd = this.systemType === SystemType.MACOS ? 'chmod a+rwx' : 'chmod 666';
+            if (exists) {
+                await SudoPromptHelper.exec(`${chmodCmd} ${quoted}`);
+            } else {
+                await SudoPromptHelper.exec(`touch ${quoted} && ${chmodCmd} ${quoted}`);
             }
         } catch (error) {
             console.error(`Failed to get permission for ${filePath}:`, error);
@@ -910,32 +968,28 @@ export class FileDom {
     private async writeWithPermission(filePath: string, content: string): Promise<void> {
         try {
             await fse.writeFile(filePath, content, { encoding: 'utf-8' });
-        } catch (err) {
-            await this.getFilePermission(filePath);
-            await fse.writeFile(filePath, content, { encoding: 'utf-8' });
+            return;
+        } catch {
+            // Install dir is protected; unlock the folder first.
         }
+        try {
+            await ensureDirWritable(path.dirname(filePath));
+            await fse.writeFile(filePath, content, { encoding: 'utf-8' });
+            return;
+        } catch (error) {
+            if (isElevationCancelled(error)) {
+                throw error;
+            }
+            // Existing files (workbench js) can keep a restrictive ACL after the
+            // directory grant. Unlock that one file and retry.
+        }
+        await this.getFilePermission(filePath);
+        await fse.writeFile(filePath, content, { encoding: 'utf-8' });
     }
 
     // 写入备份文件
     private async bakFile(): Promise<void> {
-        try {
-            await fse.writeFile(BAK_FILE_PATH, this.bakJsContent, { encoding: 'utf-8' });
-        } catch (err) {
-            await this.createAndWriteBakFile();
-        }
-    }
-
-    // 创建并写入备份文件
-    private async createAndWriteBakFile(): Promise<void> {
-        if (this.systemType === SystemType.WINDOWS) {
-            await SudoPromptHelper.exec(`echo. > "${BAK_FILE_PATH}"`);
-            await SudoPromptHelper.exec(`icacls "${BAK_FILE_PATH}" /grant Users:F`);
-        } else {
-            await SudoPromptHelper.exec(`touch "${BAK_FILE_PATH}"`);
-            const chmodCmd = this.systemType === SystemType.MACOS ? 'chmod a+rwx' : 'chmod 666';
-            await SudoPromptHelper.exec(`${chmodCmd} "${BAK_FILE_PATH}"`);
-        }
-        await fse.writeFile(BAK_FILE_PATH, this.bakJsContent, { encoding: 'utf-8' });
+        await this.writeWithPermission(BAK_FILE_PATH, this.bakJsContent);
     }
 
     public requiresReload: boolean = true;

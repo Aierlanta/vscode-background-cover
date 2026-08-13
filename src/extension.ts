@@ -189,7 +189,8 @@ export function activate(context: ExtensionContext) {
 	context.globalState.update('ext_version',version);
 	vsHelp.showInfoSupport(`🎉 BackgroundCover 已更新至 ${version}
 🚀 更新内容：
-    1.  自动换图遇到超时、5xx、连接抖动时会静默重试；单张 404 则换下一张，不再弹出「更新失败」或清掉在线源。
+    1.  多个主窗口可以各挂一张背景图；换图不再把所有窗口刷成同一张。关掉再开同一个项目会记住上次的图，新窗口仍用默认图。
+    2.  第一次授权后放开 workbench 目录写入权限，之后开新窗口不再连弹多次管理员确认。
 
 ❤️ 觉得好用吗？支持一下在线图库运营吧！`);
 	}
