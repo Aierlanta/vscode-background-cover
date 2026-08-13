@@ -175,9 +175,7 @@ export function activate(context: ExtensionContext) {
 	context.globalState.update('ext_version',version);
 	vsHelp.showInfoSupport(`🎉 BackgroundCover 已更新至 ${version}
 🚀 更新内容：
-    1.  修复 VS Code 更新后背景不生效、必须手动关闭重开的问题（现在会引导完全退出并重启，软重载无法清除 VS Code 编译缓存）。
-    2.  修复较新版本 VS Code 安全策略（Trusted Types）下打补丁后背景 / 宠物 / 粒子完全不显示的问题。
-    3.  新增适配 Cursor Agent Window（Glass 窗口）背景显示（by @Aierlanta）。
+    1.  自动换图遇到超时、5xx、连接抖动时会静默重试；单张 404 则换下一张，不再弹出「更新失败」或清掉在线源。
 
 ❤️ 觉得好用吗？支持一下在线图库运营吧！`);
 	}
